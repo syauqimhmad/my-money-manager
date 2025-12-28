@@ -20,17 +20,20 @@ def load_data():
 
 # Fungsi Helper untuk Perhitungan
 def calculate_metrics(df, start_date, end_date):
-    # Create a copy and extract date part only
+    # Create a copy
     df_copy = df.copy()
     
-    # Convert to date strings for safe comparison
-    df_copy['date_str'] = pd.to_datetime(df_copy['date']).dt.date
+    # Convert start_date and end_date to datetime with full day range
+    # Start: 00:00:00, End: 23:59:59.999999
+    start_dt = pd.Timestamp(start_date).normalize()  # 00:00:00
+    end_dt = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)  # 23:59:59.999999
+    
+    # Ensure date column is timezone-naive for comparison
+    if df_copy['date'].dt.tz is not None:
+        df_copy['date'] = df_copy['date'].dt.tz_localize(None)
     
     # Filter by date range
-    df_period = df_copy[(df_copy['date_str'] >= start_date) & (df_copy['date_str'] <= end_date)].copy()
-    
-    # Restore original date column
-    df_period['date'] = pd.to_datetime(df_period['date'])
+    df_period = df_copy[(df_copy['date'] >= start_dt) & (df_copy['date'] <= end_dt)].copy()
     
     income = df_period[df_period['amount'] > 0]['amount'].sum()
     expense = abs(df_period[df_period['amount'] < 0]['amount'].sum())
@@ -57,7 +60,11 @@ df = pd.DataFrame(rows)
 # Convert date column to datetime, handling various formats
 try:
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    df['date_only'] = df['date'].dt.date  # Create date-only column for filtering
+    
+    # Remove timezone if exists (for consistent comparison)
+    if df['date'].dt.tz is not None:
+        df['date'] = df['date'].dt.tz_localize(None)
+    
 except:
     st.error("Error converting date column. Please check your data format.")
     st.stop()
@@ -336,9 +343,10 @@ with tab4:
     
     # Monthly trend (last 6 months)
     six_months_ago = first_day_month - relativedelta(months=5)
+    six_months_ago_dt = pd.Timestamp(six_months_ago).normalize()
     
-    # Use date_only column for filtering
-    df_trend = df[df['date_only'] >= six_months_ago].copy()
+    # Use datetime comparison
+    df_trend = df[df['date'] >= six_months_ago_dt].copy()
     
     if not df_trend.empty:
         monthly_summary = df_trend.groupby('year_month').apply(
