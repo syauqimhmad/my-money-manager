@@ -20,7 +20,11 @@ def load_data():
 
 # Fungsi Helper untuk Perhitungan
 def calculate_metrics(df, start_date, end_date):
-    df_period = df[(df['date'] >= start_date) & (df['date'] <= end_date)]
+    # Convert to pandas Timestamp for comparison
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    
+    df_period = df[(df['date'] >= start_ts) & (df['date'] <= end_ts)]
     income = df_period[df_period['amount'] > 0]['amount'].sum()
     expense = abs(df_period[df_period['amount'] < 0]['amount'].sum())
     net = income - expense
@@ -129,8 +133,8 @@ with tab1:
         st.subheader("Cash Flow Trend")
         
         # Daily cash flow
-        df_period['amount_abs'] = df_period['amount']
-        daily_flow = df_period.groupby('date').agg({
+        df_period_copy = df_period.copy()
+        daily_flow = df_period_copy.groupby('date').agg({
             'amount': 'sum'
         }).reset_index()
         daily_flow['cumulative'] = daily_flow['amount'].cumsum()
@@ -242,6 +246,9 @@ with tab2:
 with tab3:
     st.subheader("🏪 Merchant Analysis")
     
+    df_expense = df_period[df_period['amount'] < 0].copy()
+    df_expense['amount_abs'] = df_expense['amount'].abs()
+    
     if not df_expense.empty and 'shop' in df_expense.columns:
         # Top merchants by spending
         merchant_spend = df_expense.groupby('shop').agg({
@@ -341,17 +348,17 @@ with tab4:
     st.plotly_chart(fig_trend, use_container_width=True)
     
     # Category trend over time
-    if not df_trend[df_trend['amount'] < 0].empty:
+    df_cat_trend_data = df_trend[df_trend['amount'] < 0].copy()
+    if not df_cat_trend_data.empty:
         st.subheader("Expense Category Trends")
         
-        df_cat_trend = df_trend[df_trend['amount'] < 0].copy()
-        df_cat_trend['amount_abs'] = df_cat_trend['amount'].abs()
+        df_cat_trend_data['amount_abs'] = df_cat_trend_data['amount'].abs()
         
-        cat_monthly = df_cat_trend.groupby(['year_month', 'category'])['amount_abs'].sum().reset_index()
+        cat_monthly = df_cat_trend_data.groupby(['year_month', 'category'])['amount_abs'].sum().reset_index()
         cat_monthly['month_str'] = cat_monthly['year_month'].astype(str)
         
         # Get top 5 categories
-        top_cats = df_cat_trend.groupby('category')['amount_abs'].sum().nlargest(5).index
+        top_cats = df_cat_trend_data.groupby('category')['amount_abs'].sum().nlargest(5).index
         cat_monthly_top = cat_monthly[cat_monthly['category'].isin(top_cats)]
         
         fig_cat_trend = px.line(
