@@ -57,6 +57,7 @@ df = pd.DataFrame(rows)
 # Convert date column to datetime, handling various formats
 try:
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['date_only'] = df['date'].dt.date  # Create date-only column for filtering
 except:
     st.error("Error converting date column. Please check your data format.")
     st.stop()
@@ -335,7 +336,9 @@ with tab4:
     
     # Monthly trend (last 6 months)
     six_months_ago = first_day_month - relativedelta(months=5)
-    df_trend = df[df['date'] >= pd.Timestamp(six_months_ago)]
+    
+    # Use date_only column for filtering
+    df_trend = df[df['date_only'] >= six_months_ago].copy()
     
     if not df_trend.empty:
         monthly_summary = df_trend.groupby('year_month').apply(
