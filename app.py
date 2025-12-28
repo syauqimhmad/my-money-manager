@@ -20,11 +20,17 @@ def load_data():
 
 # Fungsi Helper untuk Perhitungan
 def calculate_metrics(df, start_date, end_date):
-    # Convert to pandas Timestamp for comparison
-    start_ts = pd.Timestamp(start_date)
-    end_ts = pd.Timestamp(end_date)
+    # Ensure date column is datetime and normalize to date only
+    df_copy = df.copy()
+    df_copy['date_only'] = pd.to_datetime(df_copy['date']).dt.normalize()
     
-    df_period = df[(df['date'] >= start_ts) & (df['date'] <= end_ts)]
+    # Convert start_date and end_date to pandas Timestamp and normalize
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    
+    df_period = df_copy[(df_copy['date_only'] >= start_ts) & (df_copy['date_only'] <= end_ts)].copy()
+    df_period['date'] = df_period['date_only']
+    
     income = df_period[df_period['amount'] > 0]['amount'].sum()
     expense = abs(df_period[df_period['amount'] < 0]['amount'].sum())
     net = income - expense
@@ -46,7 +52,21 @@ if not rows:
 
 # Prepare DataFrame
 df = pd.DataFrame(rows)
-df['date'] = pd.to_datetime(df['date'])
+
+# Convert date column to datetime, handling various formats
+try:
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+except:
+    st.error("Error converting date column. Please check your data format.")
+    st.stop()
+
+# Remove rows with invalid dates
+df = df.dropna(subset=['date'])
+
+if df.empty:
+    st.info("No valid transactions found. Please check your data.")
+    st.stop()
+
 df['year_month'] = df['date'].dt.to_period('M')
 df['month_name'] = df['date'].dt.strftime('%B %Y')
 
@@ -180,9 +200,15 @@ with tab1:
     st.subheader("🔥 Top 10 Transactions")
     df_period_sorted = df_period.copy()
     df_period_sorted['amount_abs'] = df_period_sorted['amount'].abs()
-    top_transactions = df_period_sorted.nlargest(10, 'amount_abs')[
-        ['date', 'description', 'category', 'shop', 'amount', 'qty', 'uom']
-    ]
+    
+    # Ensure columns exist before selecting
+    available_cols = ['date', 'description', 'category', 'amount', 'qty', 'uom']
+    if 'shop' in df_period_sorted.columns:
+        available_cols.insert(1, 'shop')
+    
+    display_cols_top = [c for c in available_cols if c in df_period_sorted.columns]
+    
+    top_transactions = df_period_sorted.nlargest(10, 'amount_abs')[display_cols_top]
     st.dataframe(
         top_transactions,
         use_container_width=True,
@@ -201,7 +227,7 @@ with tab2:
     df_expense = df_period[df_period['amount'] < 0].copy()
     df_expense['amount_abs'] = df_expense['amount'].abs()
     
-    if not df_expense.empty:
+    if not df_expense.empty and 'category' in df_expense.columns:
         col_cat1, col_cat2 = st.columns([2, 1])
         
         with col_cat1:
@@ -235,9 +261,12 @@ with tab2:
         st.subheader("Detail per Kategori")
         for category in cat_expense['category'].head(5):
             with st.expander(f"📁 {category} - Rp {cat_expense[cat_expense['category']==category]['amount_abs'].values[0]:,.0f}"):
-                cat_data = df_expense[df_expense['category'] == category][
-                    ['date', 'description', 'shop', 'amount', 'qty', 'uom']
-                ].sort_values('date', ascending=False)
+                detail_cols = ['date', 'description', 'amount', 'qty', 'uom']
+                if 'shop' in df_expense.columns:
+                    detail_cols.insert(2, 'shop')
+                detail_cols_available = [c for c in detail_cols if c in df_expense.columns]
+                
+                cat_data = df_expense[df_expense['category'] == category][detail_cols_available].sort_values('date', ascending=False)
                 st.dataframe(cat_data, hide_index=True, use_container_width=True)
     else:
         st.info("Tidak ada data pengeluaran untuk periode ini")
@@ -306,71 +335,75 @@ with tab4:
     six_months_ago = first_day_month - relativedelta(months=5)
     df_trend = df[df['date'] >= pd.Timestamp(six_months_ago)]
     
-    monthly_summary = df_trend.groupby('year_month').apply(
-        lambda x: pd.Series({
-            'Income': x[x['amount'] > 0]['amount'].sum(),
-            'Expense': abs(x[x['amount'] < 0]['amount'].sum()),
-            'Net': x['amount'].sum()
-        })
-    ).reset_index()
-    monthly_summary['month_str'] = monthly_summary['year_month'].astype(str)
-    
-    # Income vs Expense Trend
-    fig_trend = go.Figure()
-    fig_trend.add_trace(go.Scatter(
-        x=monthly_summary['month_str'],
-        y=monthly_summary['Income'],
-        name='Income',
-        mode='lines+markers',
-        line=dict(color='green', width=3)
-    ))
-    fig_trend.add_trace(go.Scatter(
-        x=monthly_summary['month_str'],
-        y=monthly_summary['Expense'],
-        name='Expense',
-        mode='lines+markers',
-        line=dict(color='red', width=3)
-    ))
-    fig_trend.add_trace(go.Scatter(
-        x=monthly_summary['month_str'],
-        y=monthly_summary['Net'],
-        name='Net',
-        mode='lines+markers',
-        line=dict(color='blue', width=2, dash='dash')
-    ))
-    fig_trend.update_layout(
-        title="6-Month Income vs Expense Trend",
-        xaxis_title="Month",
-        yaxis_title="Amount (Rp)",
-        height=400,
-        hovermode='x unified'
-    )
-    st.plotly_chart(fig_trend, use_container_width=True)
-    
-    # Category trend over time
-    df_cat_trend_data = df_trend[df_trend['amount'] < 0].copy()
-    if not df_cat_trend_data.empty:
-        st.subheader("Expense Category Trends")
+    if not df_trend.empty:
+        monthly_summary = df_trend.groupby('year_month').apply(
+            lambda x: pd.Series({
+                'Income': x[x['amount'] > 0]['amount'].sum(),
+                'Expense': abs(x[x['amount'] < 0]['amount'].sum()),
+                'Net': x['amount'].sum()
+            }), include_groups=False
+        ).reset_index()
+        monthly_summary['month_str'] = monthly_summary['year_month'].astype(str)
         
-        df_cat_trend_data['amount_abs'] = df_cat_trend_data['amount'].abs()
-        
-        cat_monthly = df_cat_trend_data.groupby(['year_month', 'category'])['amount_abs'].sum().reset_index()
-        cat_monthly['month_str'] = cat_monthly['year_month'].astype(str)
-        
-        # Get top 5 categories
-        top_cats = df_cat_trend_data.groupby('category')['amount_abs'].sum().nlargest(5).index
-        cat_monthly_top = cat_monthly[cat_monthly['category'].isin(top_cats)]
-        
-        fig_cat_trend = px.line(
-            cat_monthly_top,
-            x='month_str',
-            y='amount_abs',
-            color='category',
-            title="Top 5 Categories Expense Trend",
-            markers=True
+        # Income vs Expense Trend
+        fig_trend = go.Figure()
+        fig_trend.add_trace(go.Scatter(
+            x=monthly_summary['month_str'],
+            y=monthly_summary['Income'],
+            name='Income',
+            mode='lines+markers',
+            line=dict(color='green', width=3)
+        ))
+        fig_trend.add_trace(go.Scatter(
+            x=monthly_summary['month_str'],
+            y=monthly_summary['Expense'],
+            name='Expense',
+            mode='lines+markers',
+            line=dict(color='red', width=3)
+        ))
+        fig_trend.add_trace(go.Scatter(
+            x=monthly_summary['month_str'],
+            y=monthly_summary['Net'],
+            name='Net',
+            mode='lines+markers',
+            line=dict(color='blue', width=2, dash='dash')
+        ))
+        fig_trend.update_layout(
+            title="6-Month Income vs Expense Trend",
+            xaxis_title="Month",
+            yaxis_title="Amount (Rp)",
+            height=400,
+            hovermode='x unified'
         )
-        fig_cat_trend.update_layout(height=400)
-        st.plotly_chart(fig_cat_trend, use_container_width=True)
+        st.plotly_chart(fig_trend, use_container_width=True)
+        
+        # Category trend over time
+        df_cat_trend_data = df_trend[df_trend['amount'] < 0].copy()
+        if not df_cat_trend_data.empty and 'category' in df_cat_trend_data.columns:
+            st.subheader("Expense Category Trends")
+            
+            df_cat_trend_data['amount_abs'] = df_cat_trend_data['amount'].abs()
+            
+            cat_monthly = df_cat_trend_data.groupby(['year_month', 'category'])['amount_abs'].sum().reset_index()
+            cat_monthly['month_str'] = cat_monthly['year_month'].astype(str)
+            
+            # Get top 5 categories
+            top_cats = df_cat_trend_data.groupby('category')['amount_abs'].sum().nlargest(5).index
+            cat_monthly_top = cat_monthly[cat_monthly['category'].isin(top_cats)]
+            
+            if not cat_monthly_top.empty:
+                fig_cat_trend = px.line(
+                    cat_monthly_top,
+                    x='month_str',
+                    y='amount_abs',
+                    color='category',
+                    title="Top 5 Categories Expense Trend",
+                    markers=True
+                )
+                fig_cat_trend.update_layout(height=400)
+                st.plotly_chart(fig_cat_trend, use_container_width=True)
+    else:
+        st.info("Insufficient data for trend analysis")
 
 # TAB 5: DETAILS
 with tab5:
@@ -408,10 +441,10 @@ with tab5:
     elif trans_type == "Expense":
         df_filtered = df_filtered[df_filtered['amount'] < 0]
     
-    if selected_cat != "All":
+    if selected_cat != "All" and 'category' in df_filtered.columns:
         df_filtered = df_filtered[df_filtered['category'] == selected_cat]
     
-    if selected_shop != "All":
+    if selected_shop != "All" and 'shop' in df_filtered.columns:
         df_filtered = df_filtered[df_filtered['shop'] == selected_shop]
     
     # Summary of filtered data
@@ -421,7 +454,10 @@ with tab5:
     st.info(f"Showing {filtered_count} transactions | Total: Rp {filtered_total:,.0f}")
     
     # Display table
-    display_cols = ['date', 'shop', 'description', 'category', 'amount', 'qty', 'uom']
+    display_cols = ['date', 'description', 'category', 'amount', 'qty', 'uom']
+    if 'shop' in df_filtered.columns:
+        display_cols.insert(1, 'shop')
+    
     available_cols = [c for c in display_cols if c in df_filtered.columns]
     
     df_display = df_filtered[available_cols].sort_values('date', ascending=False)
