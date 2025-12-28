@@ -20,16 +20,17 @@ def load_data():
 
 # Fungsi Helper untuk Perhitungan
 def calculate_metrics(df, start_date, end_date):
-    # Ensure date column is datetime and normalize to date only
+    # Create a copy and extract date part only
     df_copy = df.copy()
-    df_copy['date_only'] = pd.to_datetime(df_copy['date']).dt.normalize()
     
-    # Convert start_date and end_date to pandas Timestamp and normalize
-    start_ts = pd.Timestamp(start_date).normalize()
-    end_ts = pd.Timestamp(end_date).normalize()
+    # Convert to date strings for safe comparison
+    df_copy['date_str'] = pd.to_datetime(df_copy['date']).dt.date
     
-    df_period = df_copy[(df_copy['date_only'] >= start_ts) & (df_copy['date_only'] <= end_ts)].copy()
-    df_period['date'] = df_period['date_only']
+    # Filter by date range
+    df_period = df_copy[(df_copy['date_str'] >= start_date) & (df_copy['date_str'] <= end_date)].copy()
+    
+    # Restore original date column
+    df_period['date'] = pd.to_datetime(df_period['date'])
     
     income = df_period[df_period['amount'] > 0]['amount'].sum()
     expense = abs(df_period[df_period['amount'] < 0]['amount'].sum())
@@ -154,9 +155,10 @@ with tab1:
         
         # Daily cash flow
         df_period_copy = df_period.copy()
-        daily_flow = df_period_copy.groupby('date').agg({
+        daily_flow = df_period_copy.groupby(df_period_copy['date'].dt.date).agg({
             'amount': 'sum'
         }).reset_index()
+        daily_flow.columns = ['date', 'amount']
         daily_flow['cumulative'] = daily_flow['amount'].cumsum()
         
         fig_flow = go.Figure()
