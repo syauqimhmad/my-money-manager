@@ -5,12 +5,26 @@ import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
+import numpy as np
 
 # Konfigurasi Halaman
 st.set_page_config(page_title="AI Money Manager", page_icon="💰", layout="wide")
 
 # Koneksi ke Database
 conn = st.connection("supabase", type=SupabaseConnection)
+
+# Initialize session state for budget
+if 'budgets' not in st.session_state:
+    st.session_state.budgets = {
+        'total_monthly': 5000000,  # Default budget
+        'categories': {
+            'Food': 2000000,
+            'Transportation': 1000000,
+            'Shopping': 1500000,
+            'Entertainment': 500000,
+            'Others': 500000
+        }
+    }
 
 # Fungsi Ambil Data
 @st.cache_data(ttl=60)
@@ -20,19 +34,14 @@ def load_data():
 
 # Fungsi Helper untuk Perhitungan
 def calculate_metrics(df, start_date, end_date):
-    # Create a copy
     df_copy = df.copy()
     
-    # Convert start_date and end_date to datetime with full day range
-    # Start: 00:00:00, End: 23:59:59.999999
-    start_dt = pd.Timestamp(start_date).normalize()  # 00:00:00
-    end_dt = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)  # 23:59:59.999999
+    start_dt = pd.Timestamp(start_date).normalize()
+    end_dt = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
     
-    # Ensure date column is timezone-naive for comparison
     if df_copy['date'].dt.tz is not None:
         df_copy['date'] = df_copy['date'].dt.tz_localize(None)
     
-    # Filter by date range
     df_period = df_copy[(df_copy['date'] >= start_dt) & (df_copy['date'] <= end_dt)].copy()
     
     income = df_period[df_period['amount'] > 0]['amount'].sum()
@@ -47,6 +56,75 @@ def get_previous_period(start_date, end_date):
     prev_start = prev_end - delta
     return prev_start, prev_end
 
+def forecast_spending(df, periods=1):
+    """Forecast spending for next N months using simple moving average"""
+    monthly_spending = df[df['amount'] < 0].groupby(df['date'].dt.to_period('M'))['amount'].sum().abs()
+    
+    if len(monthly_spending) < 2:
+        return None
+    
+    # Use 3-month moving average or all available data if less than 3 months
+    window = min(3, len(monthly_spending))
+    forecast = monthly_spending.rolling(window=window).mean().iloc[-1]
+    
+    return forecast
+
+def calculate_burn_rate(df_period, start_date, end_date):
+    """Calculate daily burn rate and project end-of-month spending"""
+    days_elapsed = (datetime.now().date() - start_date).days + 1
+    days_in_period = (end_date - start_date).days + 1
+    
+    total_spent = abs(df_period[df_period['amount'] < 0]['amount'].sum())
+    daily_burn = total_spent / days_elapsed if days_elapsed > 0 else 0
+    projected_total = daily_burn * days_in_period
+    
+    return daily_burn, projected_total, days_elapsed, days_in_period
+
+def check_budget_alerts(df_period, budgets):
+    """Check for budget alerts"""
+    alerts = []
+    
+    # Check total budget
+    total_spent = abs(df_period[df_period['amount'] < 0]['amount'].sum())
+    total_budget = budgets['total_monthly']
+    
+    if total_spent > total_budget:
+        alerts.append({
+            'type': 'danger',
+            'category': 'Total',
+            'message': f'⚠️ Budget exceeded! Spent Rp {total_spent:,.0f} / Rp {total_budget:,.0f} ({total_spent/total_budget*100:.1f}%)'
+        })
+    elif total_spent > total_budget * 0.9:
+        alerts.append({
+            'type': 'warning',
+            'category': 'Total',
+            'message': f'⚡ Approaching budget limit! Spent Rp {total_spent:,.0f} / Rp {total_budget:,.0f} ({total_spent/total_budget*100:.1f}%)'
+        })
+    
+    # Check category budgets
+    if 'category' in df_period.columns:
+        cat_spending = df_period[df_period['amount'] < 0].groupby('category')['amount'].sum().abs()
+        
+        for category, spent in cat_spending.items():
+            if category in budgets['categories']:
+                budget = budgets['categories'][category]
+                pct = spent / budget * 100
+                
+                if spent > budget:
+                    alerts.append({
+                        'type': 'danger',
+                        'category': category,
+                        'message': f'🔴 {category}: Rp {spent:,.0f} / Rp {budget:,.0f} ({pct:.1f}%)'
+                    })
+                elif spent > budget * 0.85:
+                    alerts.append({
+                        'type': 'warning',
+                        'category': category,
+                        'message': f'🟡 {category}: Rp {spent:,.0f} / Rp {budget:,.0f} ({pct:.1f}%)'
+                    })
+    
+    return alerts
+
 # Load Data
 rows = load_data()
 
@@ -57,19 +135,14 @@ if not rows:
 # Prepare DataFrame
 df = pd.DataFrame(rows)
 
-# Convert date column to datetime, handling various formats
 try:
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
-    
-    # Remove timezone if exists (for consistent comparison)
     if df['date'].dt.tz is not None:
         df['date'] = df['date'].dt.tz_localize(None)
-    
 except:
     st.error("Error converting date column. Please check your data format.")
     st.stop()
 
-# Remove rows with invalid dates
 df = df.dropna(subset=['date'])
 
 if df.empty:
@@ -109,7 +182,7 @@ elif period_option == "6 Bulan Terakhir":
 elif period_option == "Tahun Ini":
     start_date = today.replace(month=1, day=1)
     end_date = today
-else:  # Custom
+else:
     with col_filter2:
         date_range = st.date_input(
             "Pilih Range",
@@ -128,6 +201,17 @@ income, expense, net, savings_rate, df_period = calculate_metrics(df, start_date
 prev_start, prev_end = get_previous_period(start_date, end_date)
 prev_income, prev_expense, prev_net, prev_savings_rate, _ = calculate_metrics(df, prev_start, prev_end)
 
+# --- BUDGET ALERTS ---
+if period_option == "Bulan Ini":
+    alerts = check_budget_alerts(df_period, st.session_state.budgets)
+    if alerts:
+        st.warning("### 🚨 Budget Alerts")
+        for alert in alerts:
+            if alert['type'] == 'danger':
+                st.error(alert['message'])
+            else:
+                st.warning(alert['message'])
+
 # --- KPI METRICS ---
 st.subheader(f"📊 Ringkasan Periode: {start_date.strftime('%d %b %Y')} - {end_date.strftime('%d %b %Y')}")
 
@@ -142,7 +226,6 @@ col2.metric("💸 Pengeluaran", f"Rp {expense:,.0f}", f"{expense_delta:+.1f}%", 
 col3.metric("💵 Net Cash Flow", f"Rp {net:,.0f}", f"{net_delta:+.1f}%")
 col4.metric("📈 Savings Rate", f"{savings_rate:.1f}%", f"{savings_rate - prev_savings_rate:+.1f}%")
 
-# Financial Health Score
 health_score = min(100, max(0, (savings_rate * 0.5) + (50 if net > 0 else 0)))
 health_status = "Excellent" if health_score >= 80 else "Good" if health_score >= 60 else "Fair" if health_score >= 40 else "Poor"
 col5.metric("💪 Health Score", f"{health_score:.0f}/100", health_status)
@@ -150,8 +233,8 @@ col5.metric("💪 Health Score", f"{health_score:.0f}/100", health_status)
 st.divider()
 
 # --- TABS FOR DIFFERENT ANALYSES ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Overview", "🏷️ Categories", "💳 Merchants", "📅 Trends", "📊 Details"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "📈 Overview", "🏷️ Categories", "💳 Merchants", "📅 Trends", "💰 Budget", "🔮 Forecast", "📊 Details"
 ])
 
 # TAB 1: OVERVIEW
@@ -161,7 +244,6 @@ with tab1:
     with col_a:
         st.subheader("Cash Flow Trend")
         
-        # Daily cash flow
         df_period_copy = df_period.copy()
         daily_flow = df_period_copy.groupby(df_period_copy['date'].dt.date).agg({
             'amount': 'sum'
@@ -189,7 +271,6 @@ with tab1:
     with col_b:
         st.subheader("Income vs Expense Breakdown")
         
-        # Pie chart for income vs expense
         breakdown_data = pd.DataFrame({
             'Type': ['Income', 'Expense', 'Net Savings'],
             'Amount': [income, expense, net if net > 0 else 0]
@@ -206,12 +287,10 @@ with tab1:
         fig_pie.update_layout(height=350)
         st.plotly_chart(fig_pie, use_container_width=True)
     
-    # Top Transactions
     st.subheader("🔥 Top 10 Transactions")
     df_period_sorted = df_period.copy()
     df_period_sorted['amount_abs'] = df_period_sorted['amount'].abs()
     
-    # Ensure columns exist before selecting
     available_cols = ['date', 'description', 'category', 'amount', 'qty', 'uom']
     if 'shop' in df_period_sorted.columns:
         available_cols.insert(1, 'shop')
@@ -233,7 +312,6 @@ with tab1:
 with tab2:
     st.subheader("📊 Category Analysis")
     
-    # Expense by category
     df_expense = df_period[df_period['amount'] < 0].copy()
     df_expense['amount_abs'] = df_expense['amount'].abs()
     
@@ -267,7 +345,6 @@ with tab2:
             fig_cat_pie.update_layout(height=400)
             st.plotly_chart(fig_cat_pie, use_container_width=True)
         
-        # Category Details
         st.subheader("Detail per Kategori")
         for category in cat_expense['category'].head(5):
             with st.expander(f"📁 {category} - Rp {cat_expense[cat_expense['category']==category]['amount_abs'].values[0]:,.0f}"):
@@ -289,7 +366,6 @@ with tab3:
     df_expense['amount_abs'] = df_expense['amount'].abs()
     
     if not df_expense.empty and 'shop' in df_expense.columns:
-        # Top merchants by spending
         merchant_spend = df_expense.groupby('shop').agg({
             'amount_abs': 'sum',
             'description': 'count'
@@ -325,7 +401,6 @@ with tab3:
             fig_merchant_count.update_layout(height=500)
             st.plotly_chart(fig_merchant_count, use_container_width=True)
         
-        # Merchant details table
         st.dataframe(
             merchant_spend,
             use_container_width=True,
@@ -341,11 +416,9 @@ with tab3:
 with tab4:
     st.subheader("📅 Trend Analysis")
     
-    # Monthly trend (last 6 months)
     six_months_ago = first_day_month - relativedelta(months=5)
     six_months_ago_dt = pd.Timestamp(six_months_ago).normalize()
     
-    # Use datetime comparison
     df_trend = df[df['date'] >= six_months_ago_dt].copy()
     
     if not df_trend.empty:
@@ -358,7 +431,6 @@ with tab4:
         ).reset_index()
         monthly_summary['month_str'] = monthly_summary['year_month'].astype(str)
         
-        # Income vs Expense Trend
         fig_trend = go.Figure()
         fig_trend.add_trace(go.Scatter(
             x=monthly_summary['month_str'],
@@ -390,7 +462,6 @@ with tab4:
         )
         st.plotly_chart(fig_trend, use_container_width=True)
         
-        # Category trend over time
         df_cat_trend_data = df_trend[df_trend['amount'] < 0].copy()
         if not df_cat_trend_data.empty and 'category' in df_cat_trend_data.columns:
             st.subheader("Expense Category Trends")
@@ -400,7 +471,6 @@ with tab4:
             cat_monthly = df_cat_trend_data.groupby(['year_month', 'category'])['amount_abs'].sum().reset_index()
             cat_monthly['month_str'] = cat_monthly['year_month'].astype(str)
             
-            # Get top 5 categories
             top_cats = df_cat_trend_data.groupby('category')['amount_abs'].sum().nlargest(5).index
             cat_monthly_top = cat_monthly[cat_monthly['category'].isin(top_cats)]
             
@@ -418,11 +488,265 @@ with tab4:
     else:
         st.info("Insufficient data for trend analysis")
 
-# TAB 5: DETAILS
+# TAB 5: BUDGET MANAGEMENT
 with tab5:
+    st.subheader("💰 Budget Management")
+    
+    col_b1, col_b2 = st.columns([1, 2])
+    
+    with col_b1:
+        st.markdown("### Set Monthly Budget")
+        
+        total_budget = st.number_input(
+            "Total Monthly Budget (Rp)",
+            min_value=0,
+            value=st.session_state.budgets['total_monthly'],
+            step=100000,
+            format="%d"
+        )
+        
+        st.markdown("#### Category Budgets")
+        
+        category_budgets = {}
+        
+        # Get unique categories from data
+        if 'category' in df.columns:
+            unique_categories = sorted(df['category'].dropna().unique())
+        else:
+            unique_categories = list(st.session_state.budgets['categories'].keys())
+        
+        for category in unique_categories:
+            default_val = st.session_state.budgets['categories'].get(category, 500000)
+            category_budgets[category] = st.number_input(
+                f"{category}",
+                min_value=0,
+                value=default_val,
+                step=50000,
+                format="%d",
+                key=f"budget_{category}"
+            )
+        
+        if st.button("💾 Save Budget Settings"):
+            st.session_state.budgets['total_monthly'] = total_budget
+            st.session_state.budgets['categories'] = category_budgets
+            st.success("Budget settings saved!")
+            st.rerun()
+    
+    with col_b2:
+        st.markdown("### Current Month Budget Status")
+        
+        if period_option == "Bulan Ini":
+            # Total budget progress
+            total_spent = abs(df_period[df_period['amount'] < 0]['amount'].sum())
+            total_budget_set = st.session_state.budgets['total_monthly']
+            total_pct = (total_spent / total_budget_set * 100) if total_budget_set > 0 else 0
+            
+            st.markdown(f"#### Total Budget")
+            st.progress(min(1.0, total_spent / total_budget_set))
+            
+            col_prog1, col_prog2, col_prog3 = st.columns(3)
+            col_prog1.metric("Spent", f"Rp {total_spent:,.0f}")
+            col_prog2.metric("Budget", f"Rp {total_budget_set:,.0f}")
+            col_prog3.metric("Remaining", f"Rp {max(0, total_budget_set - total_spent):,.0f}")
+            
+            # Burn rate analysis
+            daily_burn, projected_total, days_elapsed, days_in_month = calculate_burn_rate(df_period, start_date, end_date)
+            
+            st.markdown("#### 🔥 Burn Rate Analysis")
+            col_burn1, col_burn2, col_burn3 = st.columns(3)
+            col_burn1.metric("Daily Burn Rate", f"Rp {daily_burn:,.0f}")
+            col_burn2.metric("Days Elapsed", f"{days_elapsed}/{days_in_month}")
+            col_burn3.metric("Projected Total", f"Rp {projected_total:,.0f}", 
+                           delta=f"{((projected_total - total_budget_set) / total_budget_set * 100):+.1f}%",
+                           delta_color="inverse")
+            
+            # Category budget breakdown
+            st.markdown("#### Category Budget Breakdown")
+            
+            if 'category' in df_period.columns:
+                cat_spending = df_period[df_period['amount'] < 0].groupby('category')['amount'].sum().abs()
+                
+                budget_data = []
+                for category in st.session_state.budgets['categories']:
+                    spent = cat_spending.get(category, 0)
+                    budget = st.session_state.budgets['categories'][category]
+                    pct = (spent / budget * 100) if budget > 0 else 0
+                    remaining = max(0, budget - spent)
+                    
+                    budget_data.append({
+                        'Category': category,
+                        'Spent': spent,
+                        'Budget': budget,
+                        'Usage %': pct,
+                        'Remaining': remaining
+                    })
+                
+                budget_df = pd.DataFrame(budget_data)
+                
+                # Create visualization
+                fig_budget = go.Figure()
+                
+                fig_budget.add_trace(go.Bar(
+                    name='Spent',
+                    x=budget_df['Category'],
+                    y=budget_df['Spent'],
+                    marker_color='#ef4444'
+                ))
+                
+                fig_budget.add_trace(go.Bar(
+                    name='Remaining',
+                    x=budget_df['Category'],
+                    y=budget_df['Remaining'],
+                    marker_color='#10b981'
+                ))
+                
+                fig_budget.update_layout(
+                    barmode='stack',
+                    title='Budget vs Spending by Category',
+                    height=400
+                )
+                
+                st.plotly_chart(fig_budget, use_container_width=True)
+                
+                # Display table
+                st.dataframe(
+                    budget_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Spent": st.column_config.NumberColumn("Spent", format="Rp %.0f"),
+                        "Budget": st.column_config.NumberColumn("Budget", format="Rp %.0f"),
+                        "Usage %": st.column_config.NumberColumn("Usage %", format="%.1f%%"),
+                        "Remaining": st.column_config.NumberColumn("Remaining", format="Rp %.0f")
+                    }
+                )
+        else:
+            st.info("Budget tracking is only available for 'Bulan Ini' period")
+
+# TAB 6: FORECAST & INSIGHTS
+with tab6:
+    st.subheader("🔮 Financial Forecast & Insights")
+    
+    # Forecast next month spending
+    forecast = forecast_spending(df)
+    
+    if forecast:
+        col_f1, col_f2, col_f3 = st.columns(3)
+        
+        current_month_spending = abs(df_period[df_period['amount'] < 0]['amount'].sum()) if period_option == "Bulan Ini" else 0
+        
+        col_f1.metric(
+            "📊 Predicted Next Month",
+            f"Rp {forecast:,.0f}",
+            delta=f"{((forecast - current_month_spending) / current_month_spending * 100) if current_month_spending > 0 else 0:+.1f}%"
+        )
+        
+        col_f2.metric(
+            "💰 vs Budget",
+            f"Rp {st.session_state.budgets['total_monthly']:,.0f}",
+            delta=f"{((st.session_state.budgets['total_monthly'] - forecast) / st.session_state.budgets['total_monthly'] * 100):+.1f}%"
+        )
+        
+        savings_forecast = income - forecast if income > 0 else 0
+        col_f3.metric(
+            "💵 Predicted Savings",
+            f"Rp {savings_forecast:,.0f}"
+        )
+        
+        st.divider()
+        
+        # Historical vs Forecast visualization
+        st.markdown("### 📈 Spending Trend & Forecast")
+        
+        # Get last 6 months
+        six_months_ago = first_day_month - relativedelta(months=5)
+        six_months_ago_dt = pd.Timestamp(six_months_ago).normalize()
+        df_forecast = df[df['date'] >= six_months_ago_dt].copy()
+        
+        monthly_spending = df_forecast[df_forecast['amount'] < 0].groupby(
+            df_forecast['date'].dt.to_period('M')
+        )['amount'].sum().abs().reset_index()
+        monthly_spending.columns = ['month', 'spending']
+        monthly_spending['month_str'] = monthly_spending['month'].astype(str)
+        
+        # Add forecast
+        next_month = (first_day_month + relativedelta(months=1)).strftime('%Y-%m')
+        forecast_row = pd.DataFrame({
+            'month_str': [next_month],
+            'spending': [forecast],
+            'type': ['Forecast']
+        })
+        
+        monthly_spending['type'] = 'Actual'
+        
+        fig_forecast = go.Figure()
+        
+        fig_forecast.add_trace(go.Scatter(
+            x=monthly_spending['month_str'],
+            y=monthly_spending['spending'],
+            name='Actual',
+            mode='lines+markers',
+            line=dict(color='#ef4444', width=3)
+        ))
+        
+        fig_forecast.add_trace(go.Scatter(
+            x=forecast_row['month_str'],
+            y=forecast_row['spending'],
+            name='Forecast',
+            mode='markers',
+            marker=dict(size=15, color='#f59e0b', symbol='star')
+        ))
+        
+        # Add budget line
+        fig_forecast.add_hline(
+            y=st.session_state.budgets['total_monthly'],
+            line_dash="dash",
+            line_color="green",
+            annotation_text="Budget"
+        )
+        
+        fig_forecast.update_layout(
+            title='Monthly Spending Trend & Forecast',
+            xaxis_title='Month',
+            yaxis_title='Spending (Rp)',
+            height=400,
+            hovermode='x unified'
+        )
+        
+        st.plotly_chart(fig_forecast, use_container_width=True)
+        
+        # Insights
+        st.markdown("### 💡 Insights & Recommendations")
+        
+        avg_spending = monthly_spending['spending'].mean()
+        std_spending = monthly_spending['spending'].std()
+        
+        insights = []
+        
+        if forecast > st.session_state.budgets['total_monthly']:
+            insights.append("🔴 **Warning**: Forecast exceeds your monthly budget. Consider reviewing your spending plan.")
+        
+        if forecast > avg_spending * 1.2:
+            insights.append("⚠️ **Alert**: Predicted spending is 20% higher than your average. Look for areas to cut back.")
+        
+        if std_spending / avg_spending > 0.3:
+            insights.append("📊 **Volatility**: Your spending varies significantly month-to-month. Try to maintain more consistent habits.")
+        
+        if savings_rate < 20:
+            insights.append("💰 **Savings Goal**: Your savings rate is below 20%. Aim to increase it for better financial health.")
+        
+        if not insights:
+            insights.append("✅ **Great Job**: Your spending is on track and within budget!")
+        
+        for insight in insights:
+            st.info(insight)
+    else:
+        st.info("Not enough historical data to generate forecast. Need at least 2 months of data.")
+
+# TAB 7: DETAILS
+with tab7:
     st.subheader("📋 All Transactions")
     
-    # Filters
     col_f1, col_f2, col_f3 = st.columns(3)
     
     with col_f1:
@@ -446,7 +770,6 @@ with tab5:
         else:
             selected_shop = "All"
     
-    # Apply filters
     df_filtered = df_period.copy()
     
     if trans_type == "Income":
@@ -460,13 +783,11 @@ with tab5:
     if selected_shop != "All" and 'shop' in df_filtered.columns:
         df_filtered = df_filtered[df_filtered['shop'] == selected_shop]
     
-    # Summary of filtered data
     filtered_total = df_filtered['amount'].sum()
     filtered_count = len(df_filtered)
     
     st.info(f"Showing {filtered_count} transactions | Total: Rp {filtered_total:,.0f}")
     
-    # Display table
     display_cols = ['date', 'description', 'category', 'amount', 'qty', 'uom']
     if 'shop' in df_filtered.columns:
         display_cols.insert(1, 'shop')
@@ -489,7 +810,6 @@ with tab5:
         height=600
     )
     
-    # Download button
     csv = df_display.to_csv(index=False).encode('utf-8')
     st.download_button(
         label="📥 Download CSV",
@@ -498,6 +818,5 @@ with tab5:
         mime="text/csv"
     )
 
-# Footer
 st.divider()
 st.caption(f"Last updated: {datetime.now().strftime('%d %B %Y, %H:%M:%S')} | Total Transactions: {len(df)}")
